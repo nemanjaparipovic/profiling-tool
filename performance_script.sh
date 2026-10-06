@@ -9,7 +9,7 @@
 #   ./performance_script.sh login_test 60 com.example.app com.example.service
 #
 # Environment overrides:
-#   GPU_PATH=<file>   sysfs file with GPU load (first number in it is used)
+#   GPU_PATH=<file>   skip GPU detection, use the first number in this file
 #
 # Output:
 #   <test_name>_YYYYMMDD_HHMMSS.csv
@@ -21,7 +21,7 @@
 #   cpu_total_pct      whole system CPU load
 #   cpuN_pct           per-core load (N/A while the core is offline)
 #   ram_used_pct/_mb   MemTotal - MemAvailable
-#   gpu_pct            GPU load (N/A if no known GPU file is readable)
+#   gpu_pct            GPU load (N/A if no supported GPU counter is readable)
 #   <proc>_cpu_pct     process CPU as % of the whole system (max 100)
 #   <proc>_cpu_core_pct  process CPU as % of one core, like `top` (max N*100)
 #   <proc>_rss_mb      process resident memory (VmRSS)
@@ -116,37 +116,93 @@ for C in $CORES; do
 done
 
 # ------------------------------------------------------------
-# Detect GPU load file
+# Detect GPU
 #
-#   Qualcomm Adreno : /sys/class/kgsl/kgsl-3d0/gpu_busy_percentage
-#   Samsung Exynos  : /sys/kernel/gpu/gpu_busy
-#   MediaTek        : /sys/kernel/ged/hal/gpu_utilization
+# Tried in this order; the first GPU found decides the type.
+# If nothing usable is found, gpu_pct is simply N/A.
 #
-# Most of these need root on recent Android versions (SELinux).
+#   1. kgsl     Qualcomm Adreno (SM8250, QCM6490, ...)
+#               /sys/class/kgsl/kgsl-3d0/gpu_busy_percentage
+#   2. galcore  Vivante GPU with NXP driver (i.MX8)
+#               /sys/kernel/debug/gc/idle (debugfs, needs root)
+#   3. etnaviv  Vivante GPU with mainline driver: no load counter
+#   4. none
+#
+# GPU_PATH=<file> skips detection and uses the first number in
+# that file as the load.
 # ------------------------------------------------------------
+
+GPU_TYPE="none"
+GPU_NOTE=""
 
 gpu_readable()
 {
     [ -r "$1" ] && grep -q '[0-9]' "$1" 2>/dev/null
 }
 
-if [ -n "$GPU_PATH" ]; then
-    if ! gpu_readable "$GPU_PATH"; then
-        echo "WARNING: GPU_PATH is not readable: $GPU_PATH"
-        GPU_PATH=""
+detect_gpu()
+{
+    if [ -n "$GPU_PATH" ]; then
+        if gpu_readable "$GPU_PATH"; then
+            GPU_TYPE="file"
+            GPU_NOTE="$GPU_PATH"
+        else
+            GPU_NOTE="GPU_PATH not readable: $GPU_PATH"
+            GPU_PATH=""
+        fi
+        return
     fi
-else
-    for CANDIDATE in \
-        /sys/class/kgsl/kgsl-3d0/gpu_busy_percentage \
-        /sys/kernel/gpu/gpu_busy \
-        /sys/kernel/ged/hal/gpu_utilization; do
 
-        if gpu_readable "$CANDIDATE"; then
-            GPU_PATH="$CANDIDATE"
-            break
+    # 1. Qualcomm Adreno
+    if [ -d /sys/class/kgsl/kgsl-3d0 ]; then
+        F=/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage
+
+        if gpu_readable "$F"; then
+            GPU_TYPE="kgsl"
+            GPU_PATH="$F"
+            GPU_NOTE="$F"
+        else
+            GPU_NOTE="kgsl found, but $F is not readable (root needed?)"
+        fi
+        return
+    fi
+
+    # 2. Vivante, NXP galcore driver
+    if [ -e /dev/galcore ] || [ -d /sys/kernel/debug/gc ]; then
+        F=/sys/kernel/debug/gc/idle
+
+        # debugfs is often not mounted by default
+        if [ ! -e "$F" ]; then
+            mount -t debugfs none /sys/kernel/debug 2>/dev/null
+        fi
+
+        if gpu_readable "$F"; then
+            GPU_TYPE="galcore"
+            GPU_PATH="$F"
+            GPU_NOTE="$F"
+        else
+            GPU_NOTE="galcore found, but $F is not readable (root + debugfs needed)"
+        fi
+        return
+    fi
+
+    # 3. Vivante, mainline etnaviv driver
+    for D in /sys/class/drm/card*/device/driver; do
+        [ -e "$D" ] || continue
+
+        DRIVER=$(readlink "$D" 2>/dev/null)
+
+        if [ "${DRIVER##*/}" = "etnaviv" ]; then
+            GPU_NOTE="etnaviv found, no load counter available"
+            return
         fi
     done
-fi
+
+    # 4. Nothing known
+    GPU_NOTE="no supported GPU found"
+}
+
+detect_gpu
 
 # ------------------------------------------------------------
 # Find PID by process name
@@ -248,7 +304,7 @@ resolve_pids()
 #   3. new state
 #
 # State: start=<ms> t=<ms> call=<total>:<idle> c<N>=<total>:<idle>
-#        p<I>=<pid>:<starttime>:<ticks>
+#        p<I>=<pid>:<starttime>:<ticks> g=<start>:<on>:<total> (galcore)
 # ------------------------------------------------------------
 
 SAMPLE_AWK='
@@ -296,6 +352,76 @@ function busy_pct(key,    pv, dt, di, p)
         p = 100
 
     return fmt(p)
+}
+
+# galcore /sys/kernel/debug/gc/idle lists how long the GPU spent in
+# each power state:
+#   Start: <t>  End: <t>  On: <t>  Off: <t>  Idle: <t>  Suspend: <t>
+# Load = On / (On + Off + Idle + Suspend).
+#
+# Depending on the driver version the counters either restart on
+# every read or keep growing. If "Start" stays the same between two
+# reads they keep growing and the difference is used; otherwise the
+# values already cover just the last interval.
+#
+# Without a "Start" line, nanoseconds are assumed: values that add up
+# to more than 3 intervals are treated as growing counters.
+
+function galcore_pct(    line, key, num, g_start, g_on, g_total, pv, d_on, d_total, growing)
+{
+    g_start = ""
+    g_on = 0
+    g_total = 0
+
+    while ((getline line < gpu) > 0) {
+        if (!match(line, /[0-9]+/))
+            continue
+
+        num = substr(line, RSTART, RLENGTH) + 0
+
+        key = line
+        sub(/:.*/, "", key)
+        gsub(/[ \t]/, "", key)
+
+        if (key == "Start")
+            g_start = num
+        else if (key == "On") {
+            g_on = num
+            g_total += num
+        } else if (key == "Off" || key == "Idle" || key == "Suspend")
+            g_total += num
+    }
+
+    close(gpu)
+
+    if (g_total <= 0)
+        return "N/A"
+
+    state = state " g=" g_start ":" g_on ":" g_total
+
+    if (first)
+        return "N/A"
+
+    if (g_start != "")
+        growing = (("g" in P) && index(P["g"], g_start ":") == 1)
+    else
+        growing = (g_total > 3 * dt_ms * 1000000)
+
+    if (!growing)
+        return fmt(g_on * 100 / g_total)
+
+    if (!("g" in P))
+        return "N/A"
+
+    split(P["g"], pv, ":")
+
+    d_on = g_on - pv[2]
+    d_total = g_total - pv[3]
+
+    if (d_total <= 0 || d_on < 0)
+        return "N/A"
+
+    return fmt(d_on * 100 / d_total)
 }
 
 function read_rss(pid,    file, line, f, rss)
@@ -417,7 +543,9 @@ BEGIN {
 
     gpu_val = "N/A"
 
-    if (gpu != "") {
+    if (gpu_type == "galcore") {
+        gpu_val = galcore_pct()
+    } else if (gpu != "") {
         line = read_line(gpu)
 
         if (match(line, /[0-9]+(\.[0-9]+)?/))
@@ -533,6 +661,7 @@ sample()
         -v cores="$CORES" \
         -v pids="$PIDS" \
         -v gpu="$GPU_PATH" \
+        -v gpu_type="$GPU_TYPE" \
         -v hz="$HZ" \
         -v interval="$INTERVAL_MS" \
         "$SAMPLE_AWK" </dev/null)
@@ -606,7 +735,7 @@ echo "Test name : $TEST_NAME"
 echo "Duration  : ${DURATION}s"
 echo "Interval  : ${INTERVAL_MS}ms"
 echo "CPUs      : $CPU_COUNT ($CORES)"
-echo "GPU       : ${GPU_PATH:-N/A}"
+echo "GPU       : $GPU_TYPE ($GPU_NOTE)"
 echo "Output    : $OUT"
 
 if [ "$PROCESS_COUNT" -gt 0 ]; then
