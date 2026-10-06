@@ -1,4 +1,4 @@
-#!/usr/bin/sh
+#!/bin/sh
 
 # Usage:
 #   ./performance_script.sh <test_name> <duration_seconds> [process_name ...]
@@ -10,6 +10,8 @@
 #
 # Environment overrides:
 #   GPU_PATH=<file>   skip GPU detection, use the first number in this file
+#   NET_IFACES="eth0 wlan0"   network interfaces to track (default: all
+#                     non-loopback interfaces that are up and have traffic)
 #
 # Output:
 #   <test_name>_YYYYMMDD_HHMMSS.csv
@@ -22,6 +24,10 @@
 #   cpuN_pct           per-core load (N/A while the core is offline)
 #   ram_used_pct/_mb   MemTotal - MemAvailable
 #   gpu_pct            GPU load (N/A if no supported GPU counter is readable)
+#   temp_max_c         hottest thermal zone
+#   temp_cpu_max_c     hottest zone whose type contains "cpu"
+#   temp_gpu_max_c     hottest zone whose type contains "gpu"
+#   <iface>_rx/tx_mbps network throughput per interface
 #   <proc>_cpu_pct     process CPU as % of the whole system (max 100)
 #   <proc>_cpu_core_pct  process CPU as % of one core, like `top` (max N*100)
 #   <proc>_rss_mb      process resident memory (VmRSS)
@@ -205,6 +211,68 @@ detect_gpu()
 detect_gpu
 
 # ------------------------------------------------------------
+# Detect thermal zones
+#
+# Zones are grouped by their type name (cpu / gpu / other), so the
+# CSV stays small even on SoCs with dozens of zones. Zones that
+# cannot be read (disabled sensors) are skipped.
+#
+# Format passed to the sampler: "<temp_file>:<group> ..."
+# ------------------------------------------------------------
+
+THERMAL=""
+THERMAL_COUNT=0
+
+for ZONE in /sys/class/thermal/thermal_zone*; do
+    grep -q '[0-9]' "$ZONE/temp" 2>/dev/null || continue
+
+    TYPE=$(cat "$ZONE/type" 2>/dev/null)
+
+    case "$TYPE" in
+        *[Cc][Pp][Uu]*) GROUP=cpu ;;
+        *[Gg][Pp][Uu]*) GROUP=gpu ;;
+        *)              GROUP=other ;;
+    esac
+
+    THERMAL="$THERMAL $ZONE/temp:$GROUP"
+    THERMAL_COUNT=$((THERMAL_COUNT + 1))
+done
+
+# ------------------------------------------------------------
+# Detect network interfaces
+#
+# Default: every interface except lo that has already seen traffic
+# and is not down. This skips the many unused virtual interfaces
+# on Android (dummy0, sit0, ip6tnl0, ...).
+# ------------------------------------------------------------
+
+if [ -z "$NET_IFACES" ]; then
+    for IFACE in $(awk '
+        {
+            c = index($0, ":")
+
+            if (c == 0)
+                next
+
+            name = substr($0, 1, c - 1)
+            gsub(/ /, "", name)
+
+            split(substr($0, c + 1), f, " ")
+
+            if (name != "lo" && f[1] + f[9] > 0)
+                print name
+        }
+    ' /proc/net/dev 2>/dev/null); do
+
+        STATE=$(cat "/sys/class/net/$IFACE/operstate" 2>/dev/null)
+
+        if [ "$STATE" != "down" ]; then
+            NET_IFACES="$NET_IFACES $IFACE"
+        fi
+    done
+fi
+
+# ------------------------------------------------------------
 # Find PID by process name
 #
 # Prefer pidof (toybox on Android, procps on Linux). The fallback
@@ -291,7 +359,8 @@ resolve_pids()
 # Sampler
 #
 # One awk run per sample reads everything at the same moment:
-# /proc/uptime, /proc/stat, /proc/meminfo, the GPU file and
+# /proc/uptime, /proc/stat, /proc/meminfo, the GPU file, thermal
+# zones, /proc/net/dev and
 # /proc/<pid>/stat + status for each process. This keeps the
 # script's own CPU usage (and its effect on the numbers) low.
 #
@@ -304,7 +373,8 @@ resolve_pids()
 #   3. new state
 #
 # State: start=<ms> t=<ms> call=<total>:<idle> c<N>=<total>:<idle>
-#        p<I>=<pid>:<starttime>:<ticks> g=<start>:<on>:<total> (galcore)
+#        p<I>=<pid>:<starttime>:<ticks> n<I>=<rx>:<tx>
+#        g=<start>:<on>:<total> (galcore)
 # ------------------------------------------------------------
 
 SAMPLE_AWK='
@@ -424,6 +494,52 @@ function galcore_pct(    line, key, num, g_start, g_on, g_total, pv, d_on, d_tot
     return fmt(d_on * 100 / d_total)
 }
 
+# Returns "<max>,<cpu max>,<gpu max>" in degrees C.
+# Most kernels report millidegrees, some report degrees.
+
+function read_temps(    nt, tz, i, c, file, grp, line, v, t_max, t_cpu, t_gpu)
+{
+    t_max = t_cpu = t_gpu = -999
+
+    nt = split(thermal, tz, " ")
+
+    for (i = 1; i <= nt; i++) {
+        c = index(tz[i], ":")
+        file = substr(tz[i], 1, c - 1)
+        grp = substr(tz[i], c + 1)
+
+        line = read_line(file)
+
+        if (line !~ /^-?[0-9]+/)
+            continue
+
+        v = line + 0
+
+        if (v > 1000 || v < -1000)
+            v = v / 1000
+
+        # Disconnected sensors often report nonsense values
+        if (v < -40 || v > 200)
+            continue
+
+        if (v > t_max)
+            t_max = v
+
+        if (grp == "cpu" && v > t_cpu)
+            t_cpu = v
+
+        if (grp == "gpu" && v > t_gpu)
+            t_gpu = v
+    }
+
+    return temp_fmt(t_max) "," temp_fmt(t_cpu) "," temp_fmt(t_gpu)
+}
+
+function temp_fmt(v)
+{
+    return v == -999 ? "N/A" : sprintf("%.1f", v)
+}
+
 function read_rss(pid,    file, line, f, rss)
 {
     file = "/proc/" pid "/status"
@@ -444,6 +560,11 @@ function read_rss(pid,    file, line, f, rss)
 }
 
 BEGIN {
+    if (only_temps) {
+        print read_temps()
+        exit
+    }
+
     n = split(prev, kv, " ")
 
     for (i = 1; i <= n; i++) {
@@ -555,6 +676,63 @@ BEGIN {
     csv = csv "," gpu_val
 
     # --------------------------------------------------------
+    # Temperature
+    # --------------------------------------------------------
+
+    csv = csv "," read_temps()
+
+    # --------------------------------------------------------
+    # Network
+    #
+    # /proc/net/dev: "<iface>: rx_bytes ... (8 fields) tx_bytes ..."
+    # Old kernels may omit the space after the colon.
+    # --------------------------------------------------------
+
+    while ((getline line < "/proc/net/dev") > 0) {
+        c = index(line, ":")
+
+        if (c == 0)
+            continue
+
+        name = substr(line, 1, c - 1)
+        gsub(/ /, "", name)
+
+        split(substr(line, c + 1), f, " ")
+
+        RX[name] = f[1]
+        TX[name] = f[9]
+    }
+
+    close("/proc/net/dev")
+
+    ni = split(ifaces, if_list, " ")
+
+    for (i = 1; i <= ni; i++) {
+        name = if_list[i]
+        key = "n" i
+
+        rx = "N/A"
+        tx = "N/A"
+
+        if (name in RX) {
+            if (!first && (key in P) && dt_ms > 0) {
+                split(P[key], pv, ":")
+
+                # Negative difference: counter reset or wrapped
+                if (RX[name] >= pv[1])
+                    rx = sprintf("%.3f", (RX[name] - pv[1]) * 8 / (dt_ms * 1000))
+
+                if (TX[name] >= pv[2])
+                    tx = sprintf("%.3f", (TX[name] - pv[2]) * 8 / (dt_ms * 1000))
+            }
+
+            state = state " " key "=" RX[name] ":" TX[name]
+        }
+
+        csv = csv "," rx "," tx
+    }
+
+    # --------------------------------------------------------
     # Processes
     #
     # /proc/<pid>/stat: comm can contain spaces and parentheses,
@@ -662,6 +840,8 @@ sample()
         -v pids="$PIDS" \
         -v gpu="$GPU_PATH" \
         -v gpu_type="$GPU_TYPE" \
+        -v thermal="$THERMAL" \
+        -v ifaces="$NET_IFACES" \
         -v hz="$HZ" \
         -v interval="$INTERVAL_MS" \
         "$SAMPLE_AWK" </dev/null)
@@ -705,6 +885,11 @@ for C in $CORES; do
 done
 
 HEADER="$HEADER,ram_used_pct,ram_used_mb,gpu_pct"
+HEADER="$HEADER,temp_max_c,temp_cpu_max_c,temp_gpu_max_c"
+
+for IFACE in $NET_IFACES; do
+    HEADER="$HEADER,${IFACE}_rx_mbps,${IFACE}_tx_mbps"
+done
 
 I=1
 
@@ -736,6 +921,17 @@ echo "Duration  : ${DURATION}s"
 echo "Interval  : ${INTERVAL_MS}ms"
 echo "CPUs      : $CPU_COUNT ($CORES)"
 echo "GPU       : $GPU_TYPE ($GPU_NOTE)"
+echo "Network   : ${NET_IFACES:- none}"
+
+if [ "$THERMAL_COUNT" -gt 0 ]; then
+    TEMPS=$(awk -v only_temps=1 -v thermal="$THERMAL" "$SAMPLE_AWK" </dev/null)
+
+    echo "Thermal   : $THERMAL_COUNT zones"
+    echo "Temp now  : max ${TEMPS%%,*} C (cpu/gpu max: $(echo "${TEMPS#*,}" | tr ',' '/') C)"
+else
+    echo "Thermal   : none"
+fi
+
 echo "Output    : $OUT"
 
 if [ "$PROCESS_COUNT" -gt 0 ]; then
@@ -848,7 +1044,14 @@ NR == 1 {
         cnt[i]++
         sum[i] += v
 
-        if (cnt[i] == 1 || v < min[i])
+        if (cnt[i] == 1) {
+            min[i] = v
+            first[i] = v
+        }
+
+        last[i] = v
+
+        if (v < min[i])
             min[i] = v
 
         if (cnt[i] == 1 || v > max[i])
@@ -867,14 +1070,17 @@ END {
     printf "Avg interval : %.0f ms\n", interval_sum / n
     print ""
 
-    printf "%-40s %9s %9s %9s %8s\n", "metric", "avg", "min", "max", "samples"
+    # first/last show the trend, e.g. start vs end temperature
+    printf "%-40s %9s %9s %9s %9s %9s %8s\n", \
+        "metric", "avg", "min", "max", "first", "last", "samples"
 
     for (i = 4; i <= cols; i++) {
         if (cnt[i] == 0)
-            printf "%-40s %9s %9s %9s %8d\n", name[i], "N/A", "N/A", "N/A", 0
+            printf "%-40s %9s %9s %9s %9s %9s %8d\n", name[i], \
+                "N/A", "N/A", "N/A", "N/A", "N/A", 0
         else
-            printf "%-40s %9.2f %9.2f %9.2f %8d\n", name[i], \
-                sum[i] / cnt[i], min[i], max[i], cnt[i]
+            printf "%-40s %9.2f %9.2f %9.2f %9.2f %9.2f %8d\n", name[i], \
+                sum[i] / cnt[i], min[i], max[i], first[i], last[i], cnt[i]
     }
 }
 ' "$OUT"
